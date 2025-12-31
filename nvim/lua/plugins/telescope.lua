@@ -1,5 +1,4 @@
-return
-  {
+return {
     {
       'nvim-telescope/telescope.nvim',
       tag = 'v0.1.9',
@@ -23,5 +22,5 @@ return
         require("telescope").load_extension("ui-select")
       end
     }
-  }
+}
 

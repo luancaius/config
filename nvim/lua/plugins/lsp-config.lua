@@ -15,7 +15,24 @@ return {
       vim.keymap.set('n', '<leader>h', vim.lsp.buf.hover, {})
       vim.keymap.set('n', '<leader>d', vim.lsp.buf.definition, {})
       vim.keymap.set({'n'}, '<leader>c', vim.lsp.buf.code_action, {})
-      vim.lsp.config("lua_ls", {
+
+      local function setup_server(name, config)
+        if vim.lsp and vim.lsp.config then
+          vim.lsp.config(name, config)
+          if vim.lsp.enable then
+            vim.lsp.enable(name)
+          end
+          return
+        end
+
+        -- Fallback for older Neovim: use nvim-lspconfig
+        local ok, lspconfig = pcall(require, "lspconfig")
+        if ok and lspconfig[name] and lspconfig[name].setup then
+          lspconfig[name].setup(config)
+        end
+      end
+
+      setup_server("lua_ls", {
         settings = {
           Lua = {
             diagnostics = {
@@ -25,7 +42,7 @@ return {
         },
       })
 
-      vim.lsp.config("pyright", {
+      setup_server("pyright", {
         settings = {
           python = {
             analysis = {
