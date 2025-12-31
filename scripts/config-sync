@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Literal
+
+
+RepoItemType = Literal["dir", "file"]
+
+
+@dataclass(frozen=True)
+class Component:
+  name: str
+  kind: RepoItemType
+  repo_path: Path
+  home_path: Path
+
+
+def repo_root() -> Path:
+  # scripts/config-sync -> scripts/ -> repo root
+  return Path(__file__).resolve().parent.parent
+
+
+def components() -> list[Component]:
+  root = repo_root()
+  home = Path.home()
+  return [
+    Component(
+      name="nvim",
+      kind="dir",
+      repo_path=root / "nvim",
+      home_path=home / ".config" / "nvim",
+    ),
+    Component(
+      name="tmux",
+      kind="file",
+      repo_path=root / "tmux" / "tmux.conf",
+      home_path=home / ".tmux.conf",
+    ),
+    Component(
+      name="tmux-xdg",
+      kind="file",
+      repo_path=root / "tmux" / "tmux.conf",
+      home_path=home / ".config" / "tmux" / "tmux.conf",
+    ),
+  ]
+
+
+def get_component(name: str) -> Component:
+  for c in components():
+    if c.name == name:
+      return c
+  raise KeyError(name)
+
+
+def backup_base_dir(explicit: str | None) -> Path:
+  if explicit:
+    return Path(explicit).expanduser()
+  ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+  return Path.home() / ".config-sync-backups" / ts
+
+
+def backup_path_for(dst: Path, backup_dir: Path) -> Path:
+  home = Path.home().resolve()
+  dst_resolved = dst.expanduser()
+  try:
+    dst_resolved = dst_resolved.resolve()
+  except FileNotFoundError:
+    # If it doesn't exist, we won't back it up anyway.
+    pass
+
+  try:
+    rel = dst_resolved.relative_to(home)
+    return backup_dir / rel
+  except Exception:
+    # Fallback: place absolute path under ABS/
+    cleaned = str(dst_resolved).lstrip(os.sep)
+    return backup_dir / "ABS" / cleaned
+
+
+def ensure_parent(path: Path) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def need_cmd(cmd: str) -> None:
+  if shutil.which(cmd) is None:
+    raise RuntimeError(f"missing required command: {cmd}")
+
+
+def run(cmd: list[str]) -> int:
+  proc = subprocess.run(cmd)
+  return proc.returncode
+
+
+def do_backup(kind: RepoItemType, dst: Path, backup_dir: Path, *, enabled: bool) -> None:
+  if not enabled:
+    return
+  if not dst.exists():
+    return
+  bkp = backup_path_for(dst, backup_dir)
+  ensure_parent(bkp)
+
+  if kind == "dir":
+    need_cmd("rsync")
+    # Copy directory contents into backup dir
+    src = str(dst.as_posix().rstrip("/")) + "/"
+    out = str(bkp.as_posix().rstrip("/")) + "/"
+    code = run(["rsync", "-a", "--", src, out])
+    if code != 0:
+      raise RuntimeError(f"backup rsync failed with exit code {code}")
+  else:
+    shutil.copy2(dst, bkp)
+
+
+def sync_dir(src: Path, dst: Path, *, dry_run: bool, delete: bool) -> None:
+  need_cmd("rsync")
+  dst.mkdir(parents=True, exist_ok=True)
+  args = ["rsync", "-a"]
+  if dry_run:
+    args.append("--dry-run")
+  if delete:
+    args.append("--delete")
+  args += ["--", str(src.as_posix().rstrip("/")) + "/", str(dst.as_posix().rstrip("/")) + "/"]
+  code = run(args)
+  if code != 0:
+    raise RuntimeError(f"rsync failed with exit code {code}")
+
+
+def sync_file(src: Path, dst: Path, *, dry_run: bool) -> None:
+  if not src.is_file():
+    raise RuntimeError(f"source file missing: {src}")
+  ensure_parent(dst)
+
+  if dry_run:
+    need_cmd("diff")
+    if dst.exists():
+      run(["diff", "-u", "--", str(dst), str(src)])
+    else:
+      print(f"would create: {dst}")
+    return
+
+  shutil.copy2(src, dst)
+
+
+def status_dir(src: Path, dst: Path, *, delete: bool) -> None:
+  need_cmd("rsync")
+  dst.mkdir(parents=True, exist_ok=True)
+  args = ["rsync", "-a", "-n", "-i"]
+  if delete:
+    args.append("--delete")
+  args += ["--", str(src.as_posix().rstrip("/")) + "/", str(dst.as_posix().rstrip("/")) + "/"]
+  code = run(args)
+  if code != 0:
+    raise RuntimeError(f"rsync status failed with exit code {code}")
+
+
+def status_file(src: Path, dst: Path) -> None:
+  need_cmd("diff")
+  if not src.exists() and not dst.exists():
+    print(f"missing both: {src}  <->  {dst}")
+    return
+  if not src.exists():
+    print(f"missing source: {src}")
+    return
+  if not dst.exists():
+    print(f"missing destination: {dst}")
+    return
+  run(["diff", "-u", "--", str(dst), str(src)])
+
+
+def iter_targets(target: str) -> Iterable[Component]:
+  if target == "all":
+    yield from components()
+    return
+  yield get_component(target)
+
+
+def cmd_list() -> int:
+  for c in components():
+    print(
+      f"{c.name:<8} {c.repo_path}/  <->  {c.home_path}/"
+      if c.kind == "dir"
+      else f"{c.name:<8} {c.repo_path}  <->  {c.home_path}"
+    )
+  return 0
+
+
+def main(argv: list[str]) -> int:
+  p = argparse.ArgumentParser(
+    prog="config-sync",
+    description="Sync configs between this repo and your machine.",
+    usage=(
+      "config-sync <component|all> <deploy|capture|status> [options]\n"
+      "config-sync list\n"
+      "config-sync --help"
+    ),
+    epilog=(
+      "Commands:\n"
+      "  deploy      Copy from repo -> machine (apply configs)\n"
+      "  capture     Copy from machine -> repo (save current configs)\n"
+      "  status      Show what differs between repo and machine\n"
+    ),
+    formatter_class=argparse.RawTextHelpFormatter,
+    add_help=True,
+  )
+  p.add_argument("target", nargs="?", help="component name (nvim/tmux/...) or 'all', or 'list'")
+  p.add_argument("command", nargs="?", help="deploy | capture | status (omit when target is list)")
+  p.add_argument("--dry-run", action="store_true", help="show what would change without writing")
+  p.add_argument("--no-backup", action="store_true", help="disable backups before overwriting")
+  p.add_argument("--backup-dir", default=None, help="backup directory (default: ~/.config-sync-backups/<timestamp>)")
+  p.add_argument("--delete", action="store_true", help="for dir sync, delete extraneous files on destination")
+
+  args = p.parse_args(argv)
+
+  if not args.target:
+    p.print_help()
+    return 2
+
+  if args.target in {"list", "help"}:
+    return cmd_list()
+
+  if not args.command:
+    raise SystemExit("error: missing command (deploy|capture|status). Try: config-sync list")
+
+  target = args.target
+  command = args.command
+
+  if command not in {"deploy", "capture", "status"}:
+    raise SystemExit(f"error: unknown command: {command}. Try: config-sync list")
+
+  backup_dir = backup_base_dir(args.backup_dir)
+  backup_enabled = not args.no_backup and not args.dry_run
+
+  for comp in iter_targets(target):
+    if command == "status":
+      if comp.kind == "dir":
+        print(f"== {comp.name} (dir) ==", flush=True)
+        status_dir(comp.repo_path, comp.home_path, delete=args.delete)
+      else:
+        print(f"== {comp.name} (file) ==", flush=True)
+        status_file(comp.repo_path, comp.home_path)
+      continue
+
+    if command == "deploy":
+      src, dst = comp.repo_path, comp.home_path
+    else:  # capture
+      src, dst = comp.home_path, comp.repo_path
+
+    if comp.kind == "dir":
+      if not src.is_dir():
+        raise RuntimeError(f"source dir missing: {src}")
+      if dst.exists():
+        do_backup("dir", dst, backup_dir, enabled=backup_enabled)
+      sync_dir(src, dst, dry_run=args.dry_run, delete=args.delete)
+    else:
+      if not src.is_file():
+        raise RuntimeError(f"source file missing: {src}")
+      if dst.exists():
+        do_backup("file", dst, backup_dir, enabled=backup_enabled)
+      sync_file(src, dst, dry_run=args.dry_run)
+
+  return 0
+
+
+if __name__ == "__main__":
+  try:
+    raise SystemExit(main(sys.argv[1:]))
+  except KeyboardInterrupt:
+    raise SystemExit(130)
+  except RuntimeError as e:
+    print(f"error: {e}", file=sys.stderr)
+    raise SystemExit(1)
+
+
